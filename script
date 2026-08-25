@@ -1,30 +1,36 @@
 """
-distress_analysis.py
+build_multi_region.py
 
-Builds a one-page high-yield distress dashboard from two ICE BofA H0A0
-(US High Yield index) source files:
+Multi-region version of distress_analysis.py. Builds ONE Excel workbook
+covering both the US (ICE BofA H0A0) and EUR (ICE BofA HE00) high-yield
+indices, from four source files:
 
-    Defaulted.xlsx  — bonds removed from the index due to default
-    Index.xlsx      — current index composition
+    US_Index.xlsx     — current US HY index composition (one row per bond)
+    US_default.xlsx   — bonds removed from the US HY index due to default
+    EUR_Index.xlsx    — current EUR HY index composition (one row per bond)
+    EUR_default.xlsx  — bonds removed from the EUR HY index due to default
 
-Produces a single Excel workbook (default: distress_analysis_output.xlsx) with
-three sheets:
+Output workbook has FIVE sheets:
 
-    Overview        — six formatted tables + bar charts, all on one sheet:
-                        1. Top Defaulted Issuers (last 12 months, with sector)
-                        2. Issuer Distress Ranking (current index)
-                        3. Sector Exposure & Distress Concentration (rating-based)
-                        4. Sector Distress by Spread — OAS > 1,000bps
-                        5. Historical Defaults by Sector (full history)
-                        6. Maturity Wall — CCC-and-Below vs. Full Index
-    Index Snapshot  — current index composition on its own terms: summary
-                        stats, rating-bucket distribution, sector exposure by
-                        size, top 5 issuers, subordination-type breakdown.
-    Methodology     — plain-language explanation of every filter, grouping,
-                        and formula used in the workbook.
+    US Index      — everything derivable from US_Index.xlsx alone: index
+                     summary, rating buckets, issuer distress ranking,
+                     sector exposure & CCC concentration, sector distress by
+                     OAS, sector exposure by size, top 5 issuers,
+                     subordination breakdown, maturity wall.
+    US default    — everything derivable from US_default.xlsx alone: top
+                     defaulted issuers (last 12 months) and historical
+                     defaults by sector (full history).
+    EUR index     — same structure as "US Index", built from EUR_Index.xlsx.
+    EUR default   — same structure as "US default", built from
+                     EUR_default.xlsx.
+    Methodologie  — plain-language explanation of every filter, grouping,
+                     and formula used, covering both regions.
 
 Usage:
-    python distress_analysis.py --defaulted Defaulted.xlsx --index Index.xlsx
+    python build_multi_region.py \
+        --us-index US_Index.xlsx --us-default US_default.xlsx \
+        --eur-index EUR_Index.xlsx --eur-default EUR_default.xlsx \
+        --output distress_analysis_US_EUR.xlsx
 """
 
 import argparse
@@ -33,8 +39,7 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 from openpyxl import Workbook
-from openpyxl.chart import BarChart, LineChart, Reference
-from openpyxl.chart.marker import Marker
+from openpyxl.chart import BarChart, Reference
 from openpyxl.chart.label import DataLabelList
 from openpyxl.chart.series import SeriesLabel
 from openpyxl.chart.text import RichText
@@ -43,7 +48,7 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 # =============================================================================
-# DATA BUILDERS  (unchanged analytical logic from earlier versions)
+# DATA BUILDERS  (same analytical logic as the single-region script)
 # =============================================================================
 
 RATING_RANK = {
@@ -55,6 +60,17 @@ RATING_RANK = {
     "CCC1": 8, "CCC2": 9, "CCC3": 10,
     "CC": 11, "C": 12, "D": 13,
 }
+
+RATING_BUCKET = {
+    "AAA": "Other (IG)", "AA1": "Other (IG)", "AA2": "Other (IG)", "AA3": "Other (IG)",
+    "A1": "Other (IG)", "A2": "Other (IG)", "A3": "Other (IG)",
+    "BBB1": "Other (IG)", "BBB2": "Other (IG)", "BBB3": "Other (IG)",
+    "BB1": "BB", "BB2": "BB", "BB3": "BB",
+    "B1": "B", "B2": "B", "B3": "B",
+    "CCC1": "CCC", "CCC2": "CCC", "CCC3": "CCC",
+    "CC": "CC", "C": "C", "D": "D",
+}
+RATING_BUCKET_ORDER = ["BB", "B", "CCC", "CC", "C", "D", "Other (IG)"]
 
 
 def _wavg(group: pd.DataFrame, col: str) -> float:
@@ -154,9 +170,6 @@ def build_sector_table(path: str) -> pd.DataFrame:
 
 # --- 3b. Sector distress by spread (OAS > threshold bps), current index ------
 def build_sector_oas_distress_table(path: str, oas_threshold: float = 1000) -> pd.DataFrame:
-    """Alternative, market-spread-based distress screen: an issue is flagged
-    distressed if its OAS exceeds oas_threshold (bps), rather than by rating.
-    Rolled up to sector level for comparison against the rating-based view."""
     df = pd.read_excel(path, sheet_name=0, header=1)
     df = df.dropna(subset=["Ticker"]).copy()
     df["is_wide_oas"] = df["OAS"] >= oas_threshold
@@ -197,54 +210,22 @@ def build_sector_default_history(path: str) -> pd.DataFrame:
     return table
 
 
-# --- 5. Maturity wall: CCC-and-below vs. full index, current index -----------
+# --- 5. Maturity wall: full index, current index -----------------------------
 def build_maturity_wall(path: str) -> pd.DataFrame:
-    """Combines the CCC-and-below maturity wall with the whole-index maturity
-    wall in one table, so refinancing risk in the distressed cohort can be
-    seen against the index's overall maturity profile. Unlike every other
-    table in this workbook, this one is sorted CHRONOLOGICALLY (not by size)
-    since a maturity timeline only makes sense read in calendar order."""
+    """Whole-index maturity profile only (no CCC-and-below overlay)."""
     df = pd.read_excel(path, sheet_name=0, header=1)
     df = df.dropna(subset=["Ticker"]).copy()
-    df["rating_rank"] = df["Rating"].map(RATING_RANK)
     df["Maturity Date"] = pd.to_datetime(df["Maturity Date"])
     df["Maturity_Year"] = df["Maturity Date"].dt.year
 
     total_index_fv = df["Face Value_LOC"].sum()
-    idx_by_year = df.groupby("Maturity_Year").agg(
+    wall = df.groupby("Maturity_Year").agg(
         N_Issuers_Index=("Ticker", "nunique"), FaceValue_Index=("Face Value_LOC", "sum")
-    )
-
-    ccc = df[df["rating_rank"] >= 8]
-    total_ccc_fv = ccc["Face Value_LOC"].sum()
-    ccc_by_year = ccc.groupby("Maturity_Year").agg(
-        N_Issuers_CCC=("Ticker", "nunique"), FaceValue_CCC=("Face Value_LOC", "sum")
-    )
-
-    wall = idx_by_year.join(ccc_by_year, how="left").fillna(0).reset_index()
-    wall["N_Issuers_CCC"] = wall["N_Issuers_CCC"].astype(int)
-    wall["Pct_of_CCC_Universe"] = 100 * wall["FaceValue_CCC"] / total_ccc_fv
+    ).reset_index()
     wall["Pct_of_Index"] = 100 * wall["FaceValue_Index"] / total_index_fv
 
-    wall = wall[["Maturity_Year", "N_Issuers_CCC", "N_Issuers_Index", "FaceValue_CCC",
-                 "FaceValue_Index", "Pct_of_CCC_Universe", "Pct_of_Index"]]
+    wall = wall[["Maturity_Year", "N_Issuers_Index", "FaceValue_Index", "Pct_of_Index"]]
     return wall.sort_values("Maturity_Year", ascending=True).reset_index(drop=True)
-
-
-# =============================================================================
-# INDEX SNAPSHOT — current index, sheet 3
-# =============================================================================
-
-RATING_BUCKET = {
-    "AAA": "Other (IG)", "AA1": "Other (IG)", "AA2": "Other (IG)", "AA3": "Other (IG)",
-    "A1": "Other (IG)", "A2": "Other (IG)", "A3": "Other (IG)",
-    "BBB1": "Other (IG)", "BBB2": "Other (IG)", "BBB3": "Other (IG)",
-    "BB1": "BB", "BB2": "BB", "BB3": "BB",
-    "B1": "B", "B2": "B", "B3": "B",
-    "CCC1": "CCC", "CCC2": "CCC", "CCC3": "CCC",
-    "CC": "CC", "C": "C", "D": "D",
-}
-RATING_BUCKET_ORDER = ["BB", "B", "CCC", "CC", "C", "D", "Other (IG)"]
 
 
 def _load_index(path: str) -> pd.DataFrame:
@@ -255,8 +236,6 @@ def _load_index(path: str) -> pd.DataFrame:
 
 
 def _index_as_of_label(path: str) -> str:
-    """The source file's title row (e.g. 'H0A0 for 08/04/2026') carries the
-    index's as-of date; pull it from row 1 rather than hardcoding it."""
     raw = pd.read_excel(path, sheet_name=0, header=None, nrows=1)
     return str(raw.iat[0, 0]).strip()
 
@@ -300,8 +279,6 @@ def build_rating_bucket_table(path: str) -> pd.DataFrame:
 
 
 def build_sector_size_table(path: str) -> pd.DataFrame:
-    """Sector exposure sorted by size (largest first) — a composition view,
-    distinct from the distress-sorted sector tables on the Overview sheet."""
     df = _load_index(path)
     total_fv = df["Face Value_LOC"].sum()
 
@@ -322,7 +299,6 @@ def build_sector_size_table(path: str) -> pd.DataFrame:
 
 
 def build_top_issuers_table(path: str, top_n: int = 5) -> pd.DataFrame:
-    """Largest issuers in the index by face value (position size, not distress)."""
     df = _load_index(path)
     total_fv = df["Face Value_LOC"].sum()
 
@@ -343,6 +319,29 @@ def build_top_issuers_table(path: str, top_n: int = 5) -> pd.DataFrame:
         )
     table = pd.DataFrame(rows).sort_values("Total_FaceValue", ascending=False).head(top_n).reset_index(drop=True)
     return table
+
+
+def build_country_table(path: str) -> pd.DataFrame:
+    """Country exposure — grouped by 'ISO Country Code', sorted by size
+    (largest first), analogous to build_sector_size_table but by country of
+    risk rather than industry."""
+    df = _load_index(path)
+    total_fv = df["Face Value_LOC"].sum()
+
+    rows = []
+    for country, g in df.groupby("ISO Country Code"):
+        fv = g["Face Value_LOC"].sum()
+        rows.append(
+            {
+                "Country": country,
+                "N_Issuers": g["Ticker"].nunique(),
+                "N_Bonds": len(g),
+                "Total_FaceValue": fv,
+                "Pct_of_Index": 100 * fv / total_fv,
+                "Wavg_OAS": _wavg_mv(g, "OAS"),
+            }
+        )
+    return pd.DataFrame(rows).sort_values("Total_FaceValue", ascending=False).reset_index(drop=True)
 
 
 def build_subordination_table(path: str) -> pd.DataFrame:
@@ -388,14 +387,8 @@ LEFT = Alignment(horizontal="left", vertical="center")
 
 
 def write_section(ws, df, start_row, start_col, title, note, col_formats, pct_cols, col_widths):
-    """Writes a titled, formatted table starting at (start_row, start_col).
-    pct_cols: column names whose values are 0-100 and should be stored as
-    Excel fractions (divided by 100) with a % number format.
-    Returns dict with layout info needed to attach a chart.
-    """
     n_cols = len(df.columns)
 
-    # Section title bar
     title_row = start_row
     ws.merge_cells(start_row=title_row, start_column=start_col, end_row=title_row, end_column=start_col + n_cols - 1)
     tcell = ws.cell(row=title_row, column=start_col, value=title)
@@ -403,14 +396,12 @@ def write_section(ws, df, start_row, start_col, title, note, col_formats, pct_co
     tcell.fill = SECTION_FILL
     tcell.alignment = LEFT
 
-    # Note row (methodology one-liner)
     note_row = title_row + 1
     ws.merge_cells(start_row=note_row, start_column=start_col, end_row=note_row, end_column=start_col + n_cols - 1)
     ncell = ws.cell(row=note_row, column=start_col, value=note)
     ncell.font = Font(name=FONT_NAME, size=8, italic=True, color="595959")
     ncell.alignment = LEFT
 
-    # Header row
     header_row = note_row + 1
     for j, col in enumerate(df.columns):
         c = ws.cell(row=header_row, column=start_col + j, value=col.replace("_", " "))
@@ -419,7 +410,6 @@ def write_section(ws, df, start_row, start_col, title, note, col_formats, pct_co
         c.alignment = CENTER
         c.border = THIN_BOTTOM
 
-    # Data rows
     first_data_row = header_row + 1
     for i, (_, row) in enumerate(df.iterrows()):
         r = first_data_row + i
@@ -437,9 +427,6 @@ def write_section(ws, df, start_row, start_col, title, note, col_formats, pct_co
 
     last_data_row = first_data_row + len(df) - 1
 
-    # Column widths — sections stack vertically and share the same physical
-    # columns, so take the max width requested by any section for a given
-    # column letter rather than letting the last-written section win.
     for j, col in enumerate(df.columns):
         letter = get_column_letter(start_col + j)
         wanted = col_widths.get(col, 14)
@@ -451,13 +438,12 @@ def write_section(ws, df, start_row, start_col, title, note, col_formats, pct_co
         "header_row": header_row,
         "first_data_row": first_data_row,
         "last_data_row": last_data_row,
-        "end_row": last_data_row + 1,  # blank spacer row
+        "end_row": last_data_row + 1,
         "n_cols": n_cols,
     }
 
 
 def write_summary_block(ws, summary: dict, start_row, start_col, title, value_formats=None, n_value_cols=3):
-    """Writes a compact label/value summary card, e.g. index-level totals."""
     value_formats = value_formats or {}
 
     ws.merge_cells(start_row=start_row, start_column=start_col, end_row=start_row, end_column=start_col + n_value_cols)
@@ -485,7 +471,6 @@ def write_summary_block(ws, summary: dict, start_row, start_col, title, value_fo
 
 
 def _rotate_labels(axis, angle_deg=-45, size=800):
-    """Rotate an axis's category labels so long names don't overlap."""
     axis.txPr = RichText(
         bodyPr=RichTextProperties(rot=int(angle_deg * 60000), vert="horz"),
         p=[Paragraph(pPr=ParagraphProperties(defRPr=CharacterProperties(sz=size)),
@@ -496,7 +481,7 @@ def _rotate_labels(axis, angle_deg=-45, size=800):
 def add_bar_chart(ws, anchor, title, y_title, cat_col, val_col, min_row, max_row, start_col,
                    height=9, width=17, num_fmt="#,##0", rotate_labels=True):
     chart = BarChart()
-    chart.type = "col"  # vertical columns
+    chart.type = "col"
     chart.style = 10
     chart.title = title
     chart.y_axis.title = y_title
@@ -507,11 +492,10 @@ def add_bar_chart(ws, anchor, title, y_title, cat_col, val_col, min_row, max_row
     chart.gapWidth = 40
 
     cats = Reference(ws, min_col=start_col + cat_col, min_row=min_row, max_row=max_row)
-    vals = Reference(ws, min_col=start_col + val_col, min_row=min_row - 1, max_row=max_row)  # include header for series name
+    vals = Reference(ws, min_col=start_col + val_col, min_row=min_row - 1, max_row=max_row)
     chart.add_data(vals, titles_from_data=True)
     chart.set_categories(cats)
 
-    # single, compact value-only data label above each column
     chart.dataLabels = DataLabelList()
     chart.dataLabels.showVal = True
     chart.dataLabels.showCatName = False
@@ -520,9 +504,6 @@ def add_bar_chart(ws, anchor, title, y_title, cat_col, val_col, min_row, max_row
     chart.dataLabels.showPercent = False
     chart.dataLabels.numFmt = num_fmt
 
-    # data is already sorted highest-to-lowest; for a column chart the default
-    # category order (minMax) already places the first (largest) category on
-    # the left, so no axis reversal is needed here (unlike horizontal bars).
     chart.x_axis.delete = False
     chart.y_axis.delete = False
 
@@ -535,19 +516,8 @@ def add_bar_chart(ws, anchor, title, y_title, cat_col, val_col, min_row, max_row
 def add_dual_axis_bar_chart(ws, anchor, title, cat_col, lhs_col, rhs_col, min_row, max_row, start_col,
                              lhs_name, rhs_name, lhs_y_title, rhs_y_title,
                              height=11, width=22, rotate_labels=False):
-    """Clustered column chart with the second series plotted as columns on a
-    secondary (right-hand) y-axis, since the two series (e.g. CCC-and-below
-    face value vs. full-index face value) sit on very different scales. Built
-    as two BarChart objects combined via openpyxl's '+=' combo-chart pattern.
-    Note: this workflow's own preview tool (LibreOffice) doesn't draw the
-    right-hand axis line/labels for bar-on-bar dual-axis combos even when the
-    underlying XML is correct (verified directly: two valAx elements, correct
-    axPos/crosses, not deleted, category refs present on both series) — this
-    is a known renderer limitation, not a file defect, and should display
-    correctly with a visible right-hand axis in Microsoft Excel."""
     cats = Reference(ws, min_col=start_col + cat_col, min_row=min_row, max_row=max_row)
 
-    # Primary (left-hand axis): CCC-and-below, as columns
     c1 = BarChart()
     c1.type = "col"
     c1.style = 10
@@ -566,23 +536,22 @@ def add_dual_axis_bar_chart(ws, anchor, title, cat_col, lhs_col, rhs_col, min_ro
     c1.x_axis.delete = False
     c1.y_axis.delete = False
 
-    # Secondary (right-hand axis): full index, also as columns
     c2 = BarChart()
     c2.type = "col"
     c2.gapWidth = 60
     c2.overlap = -10
     rhs_vals = Reference(ws, min_col=start_col + rhs_col, min_row=min_row - 1, max_row=max_row)
     c2.add_data(rhs_vals, titles_from_data=True)
-    c2.set_categories(cats)  # every series needs its own category reference — easy to miss when combining charts
+    c2.set_categories(cats)
     c2.series[0].tx = SeriesLabel(v=f"{rhs_name} (RHS)")
     c2.y_axis.axId = 200
-    c2.y_axis.axPos = "r"  # secondary axis must be explicitly pinned to the right side
+    c2.y_axis.axPos = "r"
     c2.y_axis.title = rhs_y_title
-    c2.y_axis.crosses = "max"  # anchor the secondary axis on the right edge of the plot
-    c2.y_axis.delete = False  # axis.delete defaults to hidden if left unset — must be explicit
+    c2.y_axis.crosses = "max"
+    c2.y_axis.delete = False
 
     c1.y_axis.crosses = "autoZero"
-    c1 += c2  # combine into one chart with two axes
+    c1 += c2
 
     c1.legend.position = "b"
     c1.height = height
@@ -595,10 +564,296 @@ def add_dual_axis_bar_chart(ws, anchor, title, cat_col, lhs_col, rhs_col, min_ro
 
 
 # =============================================================================
+# PER-REGION SHEET BUILDERS
+# =============================================================================
+
+LEFT_COL = 1
+CHART_COL = 10
+
+
+def build_index_sheet(wb, sheet_name, index_path, region_label, include_country_table=False):
+    """Everything derivable from ONE index file (current composition, one row
+    per bond): index-level summary, rating buckets, issuer distress ranking,
+    sector exposure & CCC concentration, sector distress by OAS, sector
+    exposure by size, top 5 issuers, subordination breakdown, maturity wall."""
+    ws = wb.create_sheet(sheet_name)
+    ws.sheet_view.showGridLines = False
+
+    ws.merge_cells("A1:P1")
+    t = ws.cell(row=1, column=1, value=f"ICE BofA {region_label} High Yield Index — Distress & Composition Dashboard")
+    t.font = TITLE_FONT
+    t.fill = TITLE_FILL
+    t.alignment = LEFT
+    ws.merge_cells("A2:P2")
+    s = ws.cell(row=2, column=1, value=f"Generated {datetime.today().strftime('%Y-%m-%d')}  |  Source: "
+                                        f"{index_path}  |  Data-only, no external sources")
+    s.font = Font(name=FONT_NAME, size=9, italic=True, color="1F4E78")
+    ws.row_dimensions[1].height = 22
+
+    row = 4
+
+    # --- Index summary card ---
+    summary = build_index_summary(index_path)
+    summary_fmt = {
+        "Total Face Value ($mm)": "#,##0",
+        "Wtd Avg Price": "0.00",
+        "Wtd Avg OAS (bps)": "#,##0",
+        "Wtd Avg Yield to Worst": "0.0%",
+        "Wtd Avg Effective Duration (yrs)": "0.00",
+    }
+    sinfo = write_summary_block(ws, summary, row, LEFT_COL, f"{region_label} Index Summary", value_formats=summary_fmt)
+    row = sinfo["end_row"] + 3
+
+    # --- Rating bucket distribution + chart ---
+    rating_buckets = build_rating_bucket_table(index_path)
+    fmt_rb = {"Total_FaceValue": "#,##0", "Pct_of_Index": "0.0%"}
+    widths_rb = {"Rating Bucket": 16, "N_Issuers": 11, "N_Bonds": 10, "Total_FaceValue": 15, "Pct_of_Index": 13}
+    info_rb = write_section(
+        ws, rating_buckets, row, LEFT_COL,
+        "Rating Bucket Distribution",
+        "Ratings rolled up to BB / B / CCC / CC / C / D | Ordered by seniority (not size)",
+        fmt_rb, pct_cols={"Pct_of_Index"}, col_widths=widths_rb,
+    )
+    cat_idx = list(rating_buckets.columns).index("Rating Bucket")
+    val_idx = list(rating_buckets.columns).index("Total_FaceValue")
+    add_bar_chart(
+        ws, f"{get_column_letter(CHART_COL)}{row}",
+        "Face Value by Rating Bucket ($mm)", "$mm",
+        cat_idx, val_idx, info_rb["first_data_row"], info_rb["last_data_row"], LEFT_COL,
+        height=10, width=16, num_fmt="#,##0", rotate_labels=False,
+    )
+    row = max(info_rb["end_row"], row + 22) + 3
+
+    # --- Issuer distress ranking + chart ---
+    distress = build_distress_table(index_path, top_n=10)
+    fmt2 = {"Total_FaceValue": "#,##0", "Wavg_Price": "0.00", "Wavg_OAS": "#,##0", "Wavg_YTW": "0.0%",
+            "Distress_Score": "0.00"}
+    widths2 = {"Ticker": 10, "Description": 42, "Worst_Rating": 11, "Total_FaceValue": 14,
+               "Wavg_Price": 11, "Wavg_OAS": 11, "Wavg_YTW": 11, "Distress_Score": 13}
+    info2 = write_section(
+        ws, distress, row, LEFT_COL,
+        "Issuer Distress Ranking (Top 10)",
+        "Composite z-score of rating, price, OAS, yield to worst | Price/OAS/YTW mkt-value-wtd, score/totals face-value-wtd | Sorted high-to-low",
+        fmt2, pct_cols={"Wavg_YTW"}, col_widths=widths2,
+    )
+    cat_idx = list(distress.columns).index("Ticker")
+    val_idx = list(distress.columns).index("Distress_Score")
+    add_bar_chart(
+        ws, f"{get_column_letter(CHART_COL)}{row}",
+        "Issuer Distress Score (higher = more distressed)", "z-score",
+        cat_idx, val_idx, info2["first_data_row"], info2["last_data_row"], LEFT_COL,
+        height=10, width=18, num_fmt="0.00", rotate_labels=False,
+    )
+    row = max(info2["end_row"], row + 22) + 3
+
+    # --- Sector exposure & CCC concentration + chart ---
+    sector = build_sector_table(index_path)
+    fmt3 = {"Total_FaceValue": "#,##0", "Pct_of_Index": "0.0%", "Wavg_OAS": "#,##0", "Wavg_YTW": "0.0%",
+            "Pct_Sector_CCC_or_below": "0.0%"}
+    widths3 = {"Sector": 24, "N_Issuers": 11, "Total_FaceValue": 15, "Pct_of_Index": 13,
+               "Wavg_OAS": 11, "Wavg_YTW": 11, "Pct_Sector_CCC_or_below": 16}
+    info3 = write_section(
+        ws, sector, row, LEFT_COL,
+        "Sector Exposure & Distress Concentration",
+        "Grouped by Industry Lvl 3 | CCC-or-below = rating rank >= 8 | Sorted high-to-low by %CCC-or-below",
+        fmt3, pct_cols={"Pct_of_Index", "Wavg_YTW", "Pct_Sector_CCC_or_below"}, col_widths=widths3,
+    )
+    cat_idx = list(sector.columns).index("Sector")
+    val_idx = list(sector.columns).index("Pct_Sector_CCC_or_below")
+    add_bar_chart(
+        ws, f"{get_column_letter(CHART_COL)}{row}",
+        "% of Sector Face Value Rated CCC or Below", "%",
+        cat_idx, val_idx, info3["first_data_row"], info3["last_data_row"], LEFT_COL,
+        height=12, width=26, num_fmt="0.0%",
+    )
+    row = max(info3["end_row"], row + 26) + 3
+
+    # --- Sector distress by spread (OAS > 1,000bps) + chart ---
+    sector_oas = build_sector_oas_distress_table(index_path, oas_threshold=1000)
+    fmt4b = {"Total_FaceValue": "#,##0", "Pct_of_Index": "0.0%", "FaceValue_OAS_over_Threshold": "#,##0",
+             "Pct_Sector_OAS_over_Threshold": "0.0%"}
+    widths4b = {"Sector": 24, "N_Issuers": 11, "N_Issuers_Distressed": 15, "Total_FaceValue": 15,
+                "Pct_of_Index": 13, "FaceValue_OAS_over_Threshold": 18, "Pct_Sector_OAS_over_Threshold": 18}
+    info4b = write_section(
+        ws, sector_oas, row, LEFT_COL,
+        "Sector Distress by Spread — OAS > 1,000bps",
+        "Distress = OAS >= 1,000bps (independent of rating) | Grouped by Industry Lvl 3 | Sorted high-to-low by %distressed",
+        fmt4b, pct_cols={"Pct_of_Index", "Pct_Sector_OAS_over_Threshold"}, col_widths=widths4b,
+    )
+    cat_idx = list(sector_oas.columns).index("Sector")
+    val_idx = list(sector_oas.columns).index("Pct_Sector_OAS_over_Threshold")
+    add_bar_chart(
+        ws, f"{get_column_letter(CHART_COL)}{row}",
+        "% of Sector Face Value with OAS > 1,000bps", "%",
+        cat_idx, val_idx, info4b["first_data_row"], info4b["last_data_row"], LEFT_COL,
+        height=12, width=26, num_fmt="0.0%",
+    )
+    row = max(info4b["end_row"], row + 26) + 3
+
+    # --- Sector exposure by size + chart ---
+    sector_size = build_sector_size_table(index_path)
+    fmt_sec = {"Total_FaceValue": "#,##0", "Pct_of_Index": "0.0%", "Wavg_OAS": "#,##0"}
+    widths_sec = {"Sector": 24, "N_Issuers": 11, "N_Bonds": 10, "Total_FaceValue": 15, "Pct_of_Index": 13, "Wavg_OAS": 11}
+    info_sec = write_section(
+        ws, sector_size, row, LEFT_COL,
+        "Sector Exposure (by Size)",
+        "Grouped by Industry Lvl 3 | Sorted high-to-low by face value (composition view, not distress)",
+        fmt_sec, pct_cols={"Pct_of_Index"}, col_widths=widths_sec,
+    )
+    cat_idx = list(sector_size.columns).index("Sector")
+    val_idx = list(sector_size.columns).index("Total_FaceValue")
+    add_bar_chart(
+        ws, f"{get_column_letter(CHART_COL)}{row}",
+        "Sector Exposure — Face Value ($mm)", "$mm",
+        cat_idx, val_idx, info_sec["first_data_row"], info_sec["last_data_row"], LEFT_COL,
+        height=12, width=26, num_fmt="#,##0",
+    )
+    row = max(info_sec["end_row"], row + 26) + 3
+
+    # --- Country exposure + chart (optional) ---
+    if include_country_table:
+        country = build_country_table(index_path)
+        fmt_ctry = {"Total_FaceValue": "#,##0", "Pct_of_Index": "0.0%", "Wavg_OAS": "#,##0"}
+        widths_ctry = {"Country": 14, "N_Issuers": 11, "N_Bonds": 10, "Total_FaceValue": 15,
+                       "Pct_of_Index": 13, "Wavg_OAS": 11}
+        info_ctry = write_section(
+            ws, country, row, LEFT_COL,
+            "Country Exposure (by Size)",
+            "Grouped by ISO Country Code | Sorted high-to-low by face value (composition view, not distress)",
+            fmt_ctry, pct_cols={"Pct_of_Index"}, col_widths=widths_ctry,
+        )
+        cat_idx = list(country.columns).index("Country")
+        val_idx = list(country.columns).index("Pct_of_Index")
+        add_bar_chart(
+            ws, f"{get_column_letter(CHART_COL)}{row}",
+            "Country Share of Index (% of Face Value)", "%",
+            cat_idx, val_idx, info_ctry["first_data_row"], info_ctry["last_data_row"], LEFT_COL,
+            height=12, width=22, num_fmt="0.0%", rotate_labels=True,
+        )
+        row = max(info_ctry["end_row"], row + 22) + 3
+
+    # --- Top 5 issuers by face value + chart ---
+    top_issuers = build_top_issuers_table(index_path, top_n=5)
+    fmt_top = {"Total_FaceValue": "#,##0", "Pct_of_Index": "0.0%", "Wavg_OAS": "#,##0"}
+    widths_top = {"Ticker": 10, "Description": 42, "Sector": 16, "N_Bonds": 9, "Total_FaceValue": 15,
+                  "Pct_of_Index": 13, "Best_Rating": 12, "Wavg_OAS": 11}
+    info_top = write_section(
+        ws, top_issuers, row, LEFT_COL,
+        "Top 5 Issuers (by Face Value)",
+        "Grouped by Ticker | 'Best Rating' = highest-rated tranche the issuer has | Sorted high-to-low by face value (position size, not distress)",
+        fmt_top, pct_cols={"Pct_of_Index"}, col_widths=widths_top,
+    )
+    cat_idx = list(top_issuers.columns).index("Ticker")
+    val_idx = list(top_issuers.columns).index("Total_FaceValue")
+    add_bar_chart(
+        ws, f"{get_column_letter(CHART_COL)}{row}",
+        "Top 5 Issuers — Face Value ($mm)", "$mm",
+        cat_idx, val_idx, info_top["first_data_row"], info_top["last_data_row"], LEFT_COL,
+        height=9, width=14, num_fmt="#,##0", rotate_labels=False,
+    )
+    row = max(info_top["end_row"], row + 20) + 3
+
+    # --- Subordination type breakdown (no chart) ---
+    subordination = build_subordination_table(index_path)
+    fmt_sub = {"Total_FaceValue": "#,##0", "Pct_of_Index": "0.0%"}
+    widths_sub = {"Subordination Type": 22, "N_Bonds": 10, "Total_FaceValue": 15, "Pct_of_Index": 13}
+    info_sub = write_section(
+        ws, subordination, row, LEFT_COL,
+        "Subordination Type Breakdown",
+        "Grouped by Subordination Type | Sorted high-to-low by face value",
+        fmt_sub, pct_cols={"Pct_of_Index"}, col_widths=widths_sub,
+    )
+    row = info_sub["end_row"] + 3
+
+    # --- Maturity wall — full index ---
+    maturity_wall = build_maturity_wall(index_path)
+    fmt6 = {"Maturity_Year": "0", "N_Issuers_Index": "0", "FaceValue_Index": "#,##0", "Pct_of_Index": "0.0%"}
+    widths6 = {"Maturity_Year": 14, "N_Issuers_Index": 15, "FaceValue_Index": 15, "Pct_of_Index": 13}
+    info6 = write_section(
+        ws, maturity_wall, row, LEFT_COL,
+        "Maturity Wall — Full Index",
+        "Grouped by maturity year | Sorted CHRONOLOGICALLY (exception to this sheet's high-to-low convention)",
+        fmt6, pct_cols={"Pct_of_Index"}, col_widths=widths6,
+    )
+    cat_idx = list(maturity_wall.columns).index("Maturity_Year")
+    val_idx = list(maturity_wall.columns).index("FaceValue_Index")
+    add_bar_chart(
+        ws, f"{get_column_letter(CHART_COL)}{row}",
+        "Face Value Maturing, by Year — Full Index ($mm)", "$mm",
+        cat_idx, val_idx, info6["first_data_row"], info6["last_data_row"], LEFT_COL,
+        height=11, width=22, num_fmt="#,##0", rotate_labels=False,
+    )
+
+    return {"fv_oas": _wavg(_load_index(index_path), "OAS"), "mv_oas": _wavg_mv(_load_index(index_path), "OAS")}
+
+
+def build_default_sheet(wb, sheet_name, defaulted_path, region_label, months_back=12):
+    """Everything derivable from ONE defaulted-bonds file: top defaulted
+    issuers (last N months) and historical defaults by sector (full
+    history)."""
+    ws = wb.create_sheet(sheet_name)
+    ws.sheet_view.showGridLines = False
+
+    ws.merge_cells("A1:P1")
+    t = ws.cell(row=1, column=1, value=f"ICE BofA {region_label} High Yield Index — Default History")
+    t.font = TITLE_FONT
+    t.fill = TITLE_FILL
+    t.alignment = LEFT
+    ws.merge_cells("A2:P2")
+    s = ws.cell(row=2, column=1, value=f"Generated {datetime.today().strftime('%Y-%m-%d')}  |  Source: "
+                                        f"{defaulted_path}  |  Data-only, no external sources")
+    s.font = Font(name=FONT_NAME, size=9, italic=True, color="1F4E78")
+    ws.row_dimensions[1].height = 22
+
+    row = 4
+
+    # --- Top defaulted issuers, last N months + chart ---
+    defaulted = build_defaulted_table(defaulted_path, months_back, top_n=10)
+    fmt1 = {"Total_FaceValue_USD_mm": "#,##0.0", "Last_Removal_Date": "yyyy-mm-dd"}
+    widths1 = {"Ticker": 10, "Description": 42, "Sector": 16, "N_Bonds": 9, "Total_FaceValue_USD_mm": 16,
+               "Last_Removal_Date": 14, "Worst_Rating": 11}
+    info1 = write_section(
+        ws, defaulted, row, LEFT_COL,
+        f"Top Defaulted Issuers — Last {months_back} Months (by Face Value)",
+        f"Filter: Date Removed >= today - {months_back}mo | Grouped by issuer | Sorted high-to-low",
+        fmt1, pct_cols=set(), col_widths=widths1,
+    )
+    cat_idx = list(defaulted.columns).index("Ticker")
+    val_idx = list(defaulted.columns).index("Total_FaceValue_USD_mm")
+    add_bar_chart(
+        ws, f"{get_column_letter(CHART_COL)}{row}",
+        "Top Defaulted Issuers — Face Value ($mm)", "$mm",
+        cat_idx, val_idx, info1["first_data_row"], info1["last_data_row"], LEFT_COL,
+        height=10, width=18, num_fmt="#,##0", rotate_labels=False,
+    )
+    row = max(info1["end_row"], row + 22) + 3
+
+    # --- Historical defaults by sector, full history + chart ---
+    sector_history = build_sector_default_history(defaulted_path)
+    fmt5 = {"Total_FaceValue_USD_mm": "#,##0.0", "Avg_Price_on_Removal": "0.00"}
+    widths5 = {"Sector": 24, "N_Defaults": 12, "Total_FaceValue_USD_mm": 18, "Avg_Price_on_Removal": 16}
+    info5 = write_section(
+        ws, sector_history, row, LEFT_COL,
+        "Historical Defaults by Sector — Full History",
+        "No date filter (entire file) | Grouped by Industry Lvl 3 | Sorted high-to-low by face value",
+        fmt5, pct_cols=set(), col_widths=widths5,
+    )
+    cat_idx = list(sector_history.columns).index("Sector")
+    val_idx = list(sector_history.columns).index("Total_FaceValue_USD_mm")
+    add_bar_chart(
+        ws, f"{get_column_letter(CHART_COL)}{row}",
+        "Historical Defaults — Total Face Value ($mm)", "$mm",
+        cat_idx, val_idx, info5["first_data_row"], info5["last_data_row"], LEFT_COL,
+        height=12, width=24, num_fmt="#,##0",
+    )
+
+
+# =============================================================================
 # METHODOLOGY SHEET
 # =============================================================================
 
-def write_methodology_sheet(ws, defaulted_path, index_path, months_back, fv_oas=None, mv_oas=None):
+def write_methodology_sheet(ws, us_index_path, us_default_path, eur_index_path, eur_default_path,
+                             months_back, region_oas):
     ws.sheet_view.showGridLines = False
     ws.column_dimensions["A"].width = 110
 
@@ -623,115 +878,81 @@ def write_methodology_sheet(ws, defaulted_path, index_path, months_back, fv_oas=
     r = 1
     r = title("Methodology & Data Notes", r, size=16)
     r += 1
-    r = para(f"Generated: {datetime.today().strftime('%Y-%m-%d')}   |   Sources: {defaulted_path}, {index_path}   |   "
-             f"Analysis uses ONLY these two files — no external or web data.", r, bold=True)
+    r = para(f"Generated: {datetime.today().strftime('%Y-%m-%d')}   |   Sources: {us_index_path}, {us_default_path}, "
+             f"{eur_index_path}, {eur_default_path}   |   Analysis uses ONLY these four files — no external or web data.",
+             r, bold=True)
     r += 1
 
     r = heading("General approach", r)
-    r = para("All figures are computed directly from the two source workbooks with pandas/openpyxl. "
-             "Nothing is estimated, forecast, or pulled from outside sources. Every table below is a snapshot "
-             "as of the 'as of' date embedded in Index.xlsx and the run date above — re-running the script on "
-             "updated source files will refresh all numbers.", r)
+    r = para("All figures are computed directly from the four source workbooks with pandas/openpyxl. Nothing is "
+             "estimated, forecast, or pulled from outside sources. The same analytical logic is applied "
+             "independently to the US index (H0A0) and the EUR index (HE00) — each region's 'index' sheet is "
+             "built only from that region's index file, and each region's 'default' sheet only from that region's "
+             "defaulted-bonds file. Every table is a snapshot as of the 'as of' date embedded in each index file "
+             "and the run date above — re-running the script on updated source files will refresh all numbers.", r)
     r += 1
 
-    r = heading("1. Top Defaulted Issuers (last 12 months)", r)
-    r = para(f"Source: Defaulted.xlsx (bonds removed from the index due to default, one row per bond).", r)
-    r = para(f"Filter: 'Date Removed' >= today minus {months_back} months.", r)
-    r = para("Grouping: rows grouped by Ticker + Description (issuer level), since a single issuer can have "
-             "multiple defaulted bond tranches.", r)
-    r = para("Metric shown: sum of Face Value_USD across all of that issuer's defaulted tranches in the window. "
-             "'Sector' is the issuer's 'Industry Lvl 3 Desc' (first bond in the group — issuers don't span "
-             "sectors in this file). 'Worst Rating' is the rating shown for the issuer's bond immediately "
-             "before removal. Ranked highest to lowest face value.", r)
+    r = heading("Workbook layout", r)
+    r = para("Five sheets, one per source file plus this one: 'US Index' (from US_Index.xlsx), 'US default' "
+             "(from US_default.xlsx), 'EUR index' (from EUR_Index.xlsx), 'EUR default' (from EUR_default.xlsx), "
+             "and 'Methodologie' (this sheet, shared across both regions).", r)
     r += 1
 
-    r = heading("2. Issuer Distress Ranking (current index)", r)
-    r = para("Source: Index.xlsx (current index composition, one row per bond currently in the index).", r)
-    r = para("This is a MARKET-IMPLIED distress screen, not a fundamental credit model — there is no balance-sheet "
-             "or leverage data in the file, so it captures what bond investors are already pricing in via rating, "
-             "price, and spread, not an independent forecast.", r)
-    r = para("Four inputs, all at the individual bond level:", r)
-    r = para("  • Rating rank — each agency rating mapped to a numeric scale, BB1 (=2, safest in this index) "
-             "through D (=13, defaulted). Full mapping: BB1=2, BB2=3, BB3=4, B1=5, B2=6, B3=7, CCC1=8, CCC2=9, "
-             "CCC3=10, CC=11, C=12, D=13.", r)
-    r = para("  • Price — dollar price versus par; a low price signals the market expects a loss.", r)
-    r = para("  • OAS (option-adjusted spread) — spread over Treasuries demanded for credit risk; wider = riskier.", r)
-    r = para("  • Yield to worst — the yield equivalent of the price/spread signal.", r)
-    r = para("Each of the four inputs is standardized to a z-score ((value - mean) / std. dev.) across all bonds "
-             "in the index, with price and rating sign-flipped so that higher always means MORE distressed. The "
-             "four z-scores are averaged into one bond-level 'distress_score'.", r)
-    r = para("Bonds are then grouped by Ticker (issuer level). Price, OAS, and yield to worst are aggregated as "
-             "MARKET-VALUE-weighted averages across the issuer's tranches (weighted by the '% Mkt Value' column, "
-             "which is proportional to price x face value) — see the 'A note on weighting' section below for why. "
-             "The distress score itself, and Total Face Value, remain FACE-VALUE-weighted. 'Worst Rating' is the "
-             "lowest-rated tranche the issuer has. Issuers are ranked highest to lowest by the weighted distress "
-             "score.", r)
+    r = heading("'US Index' / 'EUR index' sheets — sections", r)
+    r = para("Each index sheet is built entirely from that region's current index-composition file (one row per "
+             "bond) and contains, top to bottom:", r)
+    r = para("Index Summary — total face value, issuer/bond counts, and market-value-weighted price, OAS, and "
+             "yield to worst (plus face-value-weighted effective duration) for the whole index.", r)
+    r = para("Rating Bucket Distribution — face value and % of index by rating bucket (BB / B / CCC / CC / C / D), "
+             "ordered by seniority.", r)
+    r = para("Issuer Distress Ranking (Top 10) — a MARKET-IMPLIED distress screen, not a fundamental credit model: "
+             "there is no balance-sheet or leverage data in these files, so it captures what bond investors are "
+             "already pricing in via rating, price, and spread, not an independent forecast. Four bond-level "
+             "inputs — rating rank (BB1=2 safest ... D=13 defaulted), Price, OAS, and Yield to Worst — are each "
+             "standardized to a z-score across all bonds in that region's index (price and rating sign-flipped so "
+             "higher always means more distressed), then averaged into a bond-level distress score. Bonds are "
+             "grouped by Ticker (issuer level); Price/OAS/YTW are market-value-weighted averages (weighted by "
+             "'% Mkt Value'), while the distress score and Total Face Value stay face-value-weighted — see 'A note "
+             "on weighting' below. Issuers ranked highest to lowest distress score.", r)
+    r = para("Sector Exposure & Distress Concentration — grouped by 'Industry Lvl 3 Desc'. An issue is 'CCC or "
+             "below' if its rating rank >= 8. 'Pct Sector CCC or below' = face value of the sector's CCC-or-below "
+             "bonds / total sector face value (face-value-weighted exposure ratio). OAS and YTW are market-value-"
+             "weighted averages across all bonds in the sector. Sorted high-to-low by %CCC-or-below.", r)
+    r = para("Sector Distress by Spread (OAS > 1,000bps) — a SECOND, independent distress definition: an issue is "
+             "flagged distressed here if its OAS >= 1,000bps, regardless of agency rating. Same sector grouping. "
+             "Cross-check against the rating-based view above: a sector can rank high on one and lower on the "
+             "other when the market is pricing in more (or less) risk than ratings have recognized yet.", r)
+    r = para("Sector Exposure (by Size) — same sector grouping, but sorted by face value (largest first) rather "
+             "than by distress: a pure composition view, with market-value-weighted OAS per sector.", r)
+    r = para("Country Exposure (by Size) — EUR INDEX SHEET ONLY. Grouped by 'ISO Country Code' (country of risk "
+             "of the issuing entity), sorted by face value (largest first). Shows each country's share of the "
+             "index by face value (composition view, not distress), plus market-value-weighted OAS per country.", r)
+    r = para("Top 5 Issuers (by Face Value) — the five largest issuers by position size (not distress); 'Best "
+             "Rating' is the issuer's highest-rated tranche.", r)
+    r = para("Subordination Type Breakdown — face value and % of index by Subordination Type (Senior / Secured / "
+             "Subordinated / etc.), sorted high-to-low by face value.", r)
+    r = para("Maturity Wall — Full Index — grouped by the calendar year of Maturity Date: number of issuers and "
+             "face value maturing that year, and that year's face value as a % of the whole index's total face "
+             "value. This is the only table on the sheet sorted CHRONOLOGICALLY (by year, ascending) rather than "
+             "by size — a maturity timeline only makes sense read in calendar order.", r)
     r += 1
 
-    r = heading("3. Sector Exposure & Distress Concentration (current index)", r)
-    r = para("Source: Index.xlsx, grouped by 'Industry Lvl 3 Desc' (the most granular sector field in the file, "
-             "e.g. Media, Telecommunications, Healthcare — 19 categories).", r)
-    r = para("An issue is flagged 'CCC or below' if its rating rank (see section 2) is >= 8, i.e. CCC1, CCC2, "
-             "CCC3, CC, C, or D.", r)
-    r = para("'Pct Sector CCC or below' = face value of that sector's CCC-or-below bonds / total face value of "
-             "the sector (face-value-weighted — this is an exposure ratio, not a price/spread average). OAS and "
-             "yield to worst are MARKET-VALUE-weighted averages across all bonds in the sector (not just the "
-             "CCC-or-below ones) — see 'A note on weighting' below.", r)
-    r += 1
-
-    r = heading("4. Sector Distress by Spread — OAS > 1,000bps (current index)", r)
-    r = para("Source: Index.xlsx. This is a SECOND, independent distress definition, deliberately different from "
-             "section 3's rating-based screen: an issue is flagged distressed here if its OAS (option-adjusted "
-             "spread) is >= 1,000bps, regardless of its agency rating.", r)
-    r = para("Grouped by 'Industry Lvl 3 Desc', same as section 3. 'N Issuers Distressed' = count of distinct "
-             "issuers in that sector with at least one bond at OAS >= 1,000bps. 'Pct Sector OAS over Threshold' = "
-             "face value of that sector's wide-spread bonds / total face value of the sector — this is the "
-             "distress ratio and drives the sort order (highest to lowest).", r)
-    r = para("Cross-check against section 3: a sector can rank high here but lower there (or vice versa) when the "
-             "market is pricing in more (or less) risk than the rating agencies have recognized yet — that gap is "
-             "itself a useful signal.", r)
-    r += 1
-
-    r = heading("5. Historical Defaults by Sector (full history)", r)
-    r = para("Source: Defaulted.xlsx, ALL rows (no date filter — this is the complete default history in the "
-             "file, not just the last 12 months), grouped by 'Industry Lvl 3 Desc'.", r)
-    r = para("Metrics: count of defaulted bonds, sum of face value at default, and the simple average of the "
-             "price on the date each bond was removed from the index (a rough proxy for average recovery). "
-             "Ranked highest to lowest total face value. This table is a useful cross-check against sections 3 "
-             "and 4 — sectors with heavy historical default activity (e.g. Media, Telecom) also tend to show "
-             "elevated current CCC concentration and wide-spread exposure.", r)
-    r += 1
-
-    r = heading("6. Maturity Wall — CCC-and-Below vs. Full Index (current index)", r)
-    r = para("Source: Index.xlsx, grouped by the calendar year of 'Maturity Date', into TWO parallel series: "
-             "the CCC-and-below cohort (rating rank >= 8, same definition as section 3) and the WHOLE index. "
-             "Both are shown in the same table and the same chart, both as columns, so the distressed maturity "
-             "profile can be read against the index's overall refinancing calendar. Because the whole index is "
-             "roughly 10x the size of the CCC-and-below cohort, 'FaceValue Index' is plotted on a secondary, "
-             "right-hand axis (labeled '(RHS)' in the legend) while 'FaceValue CCC' stays on the primary "
-             "left-hand axis (labeled '(LHS)') — so both series are readable at their own scale rather than the "
-             "CCC columns being flattened to near zero next to the much larger index columns.", r)
-    r = para("'N Issuers CCC' / 'FaceValue CCC' / 'Pct of CCC Universe' describe the CCC-and-below cohort only "
-             "(the % is that year's CCC face value / total CCC-and-below face value). 'N Issuers Index' / "
-             "'FaceValue Index' / 'Pct of Index' describe the whole index (the % is that year's face value / "
-             "total index face value). A year with a high 'Pct of CCC Universe' but a low 'Pct of Index' means "
-             "distressed refinancing risk is unusually concentrated in that year relative to the index as a "
-             "whole.", r)
-    r = para("Sorting exception: this is the only table in the workbook sorted CHRONOLOGICALLY (by 'Maturity "
-             "Year', ascending) rather than by size — a maturity timeline only makes sense read in calendar "
-             "order, and the two-series chart needs a consistent year order on the x-axis to compare CCC vs. "
-             "index side by side.", r)
-    r += 1
-
-    r = heading("Index Snapshot sheet (sheet 3)", r)
-    r = para("A separate sheet summarizing the current Index.xlsx composition on its own terms, independent of "
-             "any distress screen: total face value, issuer/bond counts, and market-value-weighted price, OAS, "
-             "and yield to worst (plus face-value-weighted effective duration) for the whole index; face value "
-             "and % of index by rating bucket (BB / B / CCC / CC / C / D, ratings rolled up from the section-2 "
-             "rating-rank mapping); sector exposure sorted by size (largest sector first, NOT by distress — a "
-             "composition view, with market-value-weighted OAS per sector); the 5 largest issuers by face value "
-             "(position size, not distress); and a breakdown by subordination type (Senior / Secured / "
-             "Subordinated / etc.).", r)
+    r = heading("'US default' / 'EUR default' sheets — sections", r)
+    r = para("Each default sheet is built entirely from that region's defaulted-bonds file (bonds removed from the "
+             "index due to default, one row per bond) and contains, top to bottom:", r)
+    r = para(f"Top Defaulted Issuers (last {months_back} months) — filter: 'Date Removed' >= today minus "
+             f"{months_back} months. Rows grouped by Ticker + Description (issuer level), since a single issuer "
+             "can have multiple defaulted bond tranches. Metric shown: sum of Face Value_USD across all of that "
+             "issuer's defaulted tranches in the window. 'Sector' is the issuer's 'Industry Lvl 3 Desc'. 'Worst "
+             "Rating' is the rating shown for the issuer's bond immediately before removal. Ranked highest to "
+             "lowest face value.", r)
+    r = para("Historical Defaults by Sector (full history) — ALL rows, no date filter (the complete default "
+             "history in the file), grouped by 'Industry Lvl 3 Desc'. Metrics: count of defaulted bonds, sum of "
+             "face value at default, and the simple average of the price on the date each bond was removed from "
+             "the index (a rough proxy for average recovery). Ranked highest to lowest total face value — a "
+             "useful cross-check against the sector tables on the corresponding index sheet, since sectors with "
+             "heavy historical default activity also tend to show elevated current CCC concentration and "
+             "wide-spread exposure.", r)
     r += 1
 
     r = heading("A note on weighting: face value vs. market value", r)
@@ -741,28 +962,34 @@ def write_methodology_sheet(ws, defaulted_path, index_path, months_back, fv_oas=
              "face value, % of index, CCC-or-below ratios, rating-bucket and sector composition, the distress "
              "score, and every 'top issuer' ranking. This answers 'how much is outstanding / how exposed am I' — "
              "it reflects the full par amount at stake regardless of where the bond currently trades.", r)
-    r = para("  • MARKET VALUE weighting (column '% Mkt Value', which is proportional to price x face value) is "
-             "used specifically for averaging OAS, Price, and Yield to Worst wherever they appear (issuer distress "
-             "ranking, sector tables, the Index Snapshot summary and its sector/issuer tables). This answers "
-             "'what does the index actually look like today in dollar terms' — a bond trading at $20 contributes "
-             "far less to a market-value-weighted average than the same face amount trading at $95, because it "
+    r = para("  • MARKET VALUE weighting (column '% Mkt Value', proportional to price x face value) is used "
+             "specifically for averaging OAS, Price, and Yield to Worst wherever they appear. This answers 'what "
+             "does the index actually look like today in dollar terms' — a bond trading at $20 contributes far "
+             "less to a market-value-weighted average than the same face amount trading at $95, because it "
              "represents much less real dollar exposure today. Face-value weighting a spread/price/yield average "
              "would overweight deeply distressed bonds relative to what they're actually worth in the market.", r)
-    if fv_oas is not None and mv_oas is not None:
-        r = para(f"  Concretely, on this run the index-wide Wtd Avg OAS is face-value-weighted {fv_oas:,.1f}bps "
-                 f"vs. market-value-weighted {mv_oas:,.1f}bps — the gap is entirely the deeply discounted "
-                 f"distressed names pulling less weight once you price them at what they're actually worth.", r)
+    for label, (fv_oas, mv_oas) in region_oas.items():
+        r = para(f"  Concretely, on this run the {label} index-wide Wtd Avg OAS is face-value-weighted "
+                 f"{fv_oas:,.1f}bps vs. market-value-weighted {mv_oas:,.1f}bps — the gap is entirely the deeply "
+                 f"discounted distressed names pulling less weight once you price them at what they're actually "
+                 f"worth.", r)
     r += 1
 
     r = heading("Caveats", r)
     r = para("• Market-implied, not fundamental: ratings, price, and spread reflect what the market has already "
-             "priced in on the file's 'as of' date. This is not a leverage/coverage-based default probability "
+             "priced in on each file's 'as of' date. This is not a leverage/coverage-based default probability "
              "model, and it is not a forecast.", r)
-    r = para("• Single snapshot: all Index.xlsx figures reflect one point in time. Re-running against a newer "
-             "export will move rankings, sometimes sharply, especially for names with wide spreads or low prices.", r)
-    r = para("• The 1,000bps OAS threshold in section 4 is a round-number convention, not a statistically derived "
-             "cutoff — treat it as a screening tool, not a precise boundary.", r)
-    r = para("• No data outside the two source files was used anywhere in this workbook.", r)
+    r = para("• Single snapshot per region: all index figures reflect one point in time for that region. "
+             "Re-running against newer exports will move rankings, sometimes sharply, especially for names with "
+             "wide spreads or low prices.", r)
+    r = para("• The 1,000bps OAS threshold is a round-number convention, not a statistically derived cutoff — "
+             "treat it as a screening tool, not a precise boundary.", r)
+    r = para("• US and EUR results are NOT directly comparable in absolute currency terms without care: "
+             "Face Value_LOC is in local currency (USD for the US index, EUR for the EUR index), while "
+             "Face Value_USD in the default files is already converted to USD for both regions. OAS, yield, and "
+             "duration are comparable in level terms but reflect different underlying government curves (US "
+             "Treasuries vs. Euro-area government bonds).", r)
+    r = para("• No data outside the four source files was used anywhere in this workbook.", r)
 
 
 # =============================================================================
@@ -770,277 +997,30 @@ def write_methodology_sheet(ws, defaulted_path, index_path, months_back, fv_oas=
 # =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Build a one-page HY distress dashboard workbook.")
-    parser.add_argument("--defaulted", default="Defaulted.xlsx", help="Path to Defaulted.xlsx")
-    parser.add_argument("--index", default="Index.xlsx", help="Path to Index.xlsx")
-    parser.add_argument("--months-back", type=int, default=12, help="Lookback window for defaults (months)")
-    parser.add_argument("--output", default="distress_analysis_output.xlsx", help="Path to output Excel workbook")
+    parser = argparse.ArgumentParser(description="Build a two-region (US + EUR) HY distress dashboard workbook.")
+    parser.add_argument("--us-index", default="US_Index.xlsx")
+    parser.add_argument("--us-default", default="US_default.xlsx")
+    parser.add_argument("--eur-index", default="EUR_Index.xlsx")
+    parser.add_argument("--eur-default", default="EUR_default.xlsx")
+    parser.add_argument("--months-back", type=int, default=12)
+    parser.add_argument("--output", default="distress_analysis_US_EUR.xlsx")
     args = parser.parse_args()
 
-    defaulted = build_defaulted_table(args.defaulted, args.months_back, top_n=10)
-    distress = build_distress_table(args.index, top_n=10)
-    sector = build_sector_table(args.index)
-    sector_oas = build_sector_oas_distress_table(args.index, oas_threshold=1000)
-    sector_history = build_sector_default_history(args.defaulted)
-    maturity_wall = build_maturity_wall(args.index)
-
     wb = Workbook()
-    ws = wb.active
-    ws.title = "Overview"
-    ws.sheet_view.showGridLines = False
+    wb.remove(wb.active)  # drop the default blank sheet; we create named ones explicitly
 
-    # Page title
-    ws.merge_cells("A1:P1")
-    t = ws.cell(row=1, column=1, value="ICE BofA H0A0 — High Yield Distress Dashboard")
-    t.font = TITLE_FONT
-    t.fill = TITLE_FILL
-    t.alignment = LEFT
-    ws.merge_cells("A2:P2")
-    s = ws.cell(row=2, column=1, value=f"Generated {datetime.today().strftime('%Y-%m-%d')}  |  Sources: "
-                                        f"{args.defaulted}, {args.index}  |  Data-only, no external sources")
-    s.font = Font(name=FONT_NAME, size=9, italic=True, color="1F4E78")
-    ws.row_dimensions[1].height = 22
+    us_stats = build_index_sheet(wb, "US Index", args.us_index, "US")
+    build_default_sheet(wb, "US default", args.us_default, "US", months_back=args.months_back)
+    eur_stats = build_index_sheet(wb, "EUR index", args.eur_index, "EUR", include_country_table=True)
+    build_default_sheet(wb, "EUR default", args.eur_default, "EUR", months_back=args.months_back)
 
-    row = 4
-    left_col = 1        # column A
-    chart_col = 10       # column J - charts start here
-
-    # --- Section 1: Top defaulted issuers ---
-    fmt1 = {"Total_FaceValue_USD_mm": "#,##0.0", "Last_Removal_Date": "yyyy-mm-dd"}
-    widths1 = {"Ticker": 10, "Description": 42, "Sector": 16, "N_Bonds": 9, "Total_FaceValue_USD_mm": 16,
-               "Last_Removal_Date": 14, "Worst_Rating": 11}
-    info1 = write_section(
-        ws, defaulted, row, left_col,
-        "1. Top Defaulted Issuers — Last 12 Months (by Face Value)",
-        "Source: Defaulted.xlsx | Filter: Date Removed >= today - 12mo | Grouped by issuer | Sorted high-to-low",
-        fmt1, pct_cols=set(), col_widths=widths1,
-    )
-    cat_idx = list(defaulted.columns).index("Ticker")
-    val_idx = list(defaulted.columns).index("Total_FaceValue_USD_mm")
-    add_bar_chart(
-        ws, f"{get_column_letter(chart_col)}{row}",
-        "Top Defaulted Issuers — Face Value ($mm)", "$mm",
-        cat_idx, val_idx, info1["first_data_row"], info1["last_data_row"], left_col,
-        height=10, width=18, num_fmt="#,##0", rotate_labels=False,
-    )
-    row = max(info1["end_row"], row + 22) + 3
-
-    # --- Section 2: Issuer distress ranking ---
-    fmt2 = {"Total_FaceValue": "#,##0", "Wavg_Price": "0.00", "Wavg_OAS": "#,##0", "Wavg_YTW": "0.0%",
-            "Distress_Score": "0.00"}
-    widths2 = {"Ticker": 10, "Description": 42, "Worst_Rating": 11, "Total_FaceValue": 14,
-               "Wavg_Price": 11, "Wavg_OAS": 11, "Wavg_YTW": 11, "Distress_Score": 13}
-    d2 = distress.copy()
-    d2["Wavg_YTW"] = d2["Wavg_YTW"]  # left as-is; converted to fraction below via pct_cols
-    info2 = write_section(
-        ws, d2, row, left_col,
-        "2. Issuer Distress Ranking — Current Index (Top 10)",
-        "Source: Index.xlsx | Composite z-score of rating, price, OAS, yield to worst | Price/OAS/YTW mkt-value-wtd, score/totals face-value-wtd | Sorted high-to-low",
-        fmt2, pct_cols={"Wavg_YTW"}, col_widths=widths2,
-    )
-    cat_idx = list(d2.columns).index("Ticker")
-    val_idx = list(d2.columns).index("Distress_Score")
-    add_bar_chart(
-        ws, f"{get_column_letter(chart_col)}{row}",
-        "Issuer Distress Score (higher = more distressed)", "z-score",
-        cat_idx, val_idx, info2["first_data_row"], info2["last_data_row"], left_col,
-        height=10, width=18, num_fmt="0.00", rotate_labels=False,
-    )
-    row = max(info2["end_row"], row + 22) + 3
-
-    # --- Section 3: Sector exposure & distress concentration ---
-    fmt3 = {"Total_FaceValue": "#,##0", "Pct_of_Index": "0.0%", "Wavg_OAS": "#,##0", "Wavg_YTW": "0.0%",
-            "Pct_Sector_CCC_or_below": "0.0%"}
-    widths3 = {"Sector": 24, "N_Issuers": 11, "Total_FaceValue": 15, "Pct_of_Index": 13,
-               "Wavg_OAS": 11, "Wavg_YTW": 11, "Pct_Sector_CCC_or_below": 16}
-    info3 = write_section(
-        ws, sector, row, left_col,
-        "3. Sector Exposure & Distress Concentration — Current Index",
-        "Source: Index.xlsx | Grouped by Industry Lvl 3 | CCC-or-below = rating rank >= 8 | Sorted high-to-low by %CCC-or-below",
-        fmt3, pct_cols={"Pct_of_Index", "Wavg_YTW", "Pct_Sector_CCC_or_below"}, col_widths=widths3,
-    )
-    cat_idx = list(sector.columns).index("Sector")
-    val_idx = list(sector.columns).index("Pct_Sector_CCC_or_below")
-    add_bar_chart(
-        ws, f"{get_column_letter(chart_col)}{row}",
-        "% of Sector Face Value Rated CCC or Below", "%",
-        cat_idx, val_idx, info3["first_data_row"], info3["last_data_row"], left_col,
-        height=12, width=26, num_fmt="0.0%",
-    )
-    row = max(info3["end_row"], row + 26) + 3
-
-    # --- Section 4: Sector distress by spread (OAS > 1,000bps) ---
-    fmt4b = {"Total_FaceValue": "#,##0", "Pct_of_Index": "0.0%", "FaceValue_OAS_over_Threshold": "#,##0",
-             "Pct_Sector_OAS_over_Threshold": "0.0%"}
-    widths4b = {"Sector": 24, "N_Issuers": 11, "N_Issuers_Distressed": 15, "Total_FaceValue": 15,
-                "Pct_of_Index": 13, "FaceValue_OAS_over_Threshold": 18, "Pct_Sector_OAS_over_Threshold": 18}
-    info4b = write_section(
-        ws, sector_oas, row, left_col,
-        "4. Sector Distress by Spread — OAS > 1,000bps — Current Index",
-        "Source: Index.xlsx | Distress = OAS >= 1,000bps (independent of rating) | Grouped by Industry Lvl 3 | Sorted high-to-low by %distressed",
-        fmt4b, pct_cols={"Pct_of_Index", "Pct_Sector_OAS_over_Threshold"}, col_widths=widths4b,
-    )
-    cat_idx = list(sector_oas.columns).index("Sector")
-    val_idx = list(sector_oas.columns).index("Pct_Sector_OAS_over_Threshold")
-    add_bar_chart(
-        ws, f"{get_column_letter(chart_col)}{row}",
-        "% of Sector Face Value with OAS > 1,000bps", "%",
-        cat_idx, val_idx, info4b["first_data_row"], info4b["last_data_row"], left_col,
-        height=12, width=26, num_fmt="0.0%",
-    )
-    row = max(info4b["end_row"], row + 26) + 3
-
-    # --- Section 5: Historical defaults by sector ---
-    fmt5 = {"Total_FaceValue_USD_mm": "#,##0.0", "Avg_Price_on_Removal": "0.00"}
-    widths5 = {"Sector": 24, "N_Defaults": 12, "Total_FaceValue_USD_mm": 18, "Avg_Price_on_Removal": 16}
-    info5 = write_section(
-        ws, sector_history, row, left_col,
-        "5. Historical Defaults by Sector — Full History (2021-2026)",
-        "Source: Defaulted.xlsx | No date filter (entire file) | Grouped by Industry Lvl 3 | Sorted high-to-low by face value",
-        fmt5, pct_cols=set(), col_widths=widths5,
-    )
-    cat_idx = list(sector_history.columns).index("Sector")
-    val_idx = list(sector_history.columns).index("Total_FaceValue_USD_mm")
-    add_bar_chart(
-        ws, f"{get_column_letter(chart_col)}{row}",
-        "Historical Defaults — Total Face Value ($mm)", "$mm",
-        cat_idx, val_idx, info5["first_data_row"], info5["last_data_row"], left_col,
-        height=12, width=24, num_fmt="#,##0",
-    )
-    row = max(info5["end_row"], row + 26) + 3
-
-    # --- Section 6: Maturity wall — CCC-and-below vs. full index ---
-    fmt6 = {"Maturity_Year": "0", "N_Issuers_CCC": "0", "N_Issuers_Index": "0", "FaceValue_CCC": "#,##0",
-            "FaceValue_Index": "#,##0", "Pct_of_CCC_Universe": "0.0%", "Pct_of_Index": "0.0%"}
-    widths6 = {"Maturity_Year": 14, "N_Issuers_CCC": 14, "N_Issuers_Index": 15, "FaceValue_CCC": 14,
-               "FaceValue_Index": 15, "Pct_of_CCC_Universe": 17, "Pct_of_Index": 13}
-    info6 = write_section(
-        ws, maturity_wall, row, left_col,
-        "6. Maturity Wall — CCC-and-Below vs. Full Index — Current Index",
-        "Source: Index.xlsx | CCC-and-below = rating rank >= 8 | Grouped by maturity year | Sorted CHRONOLOGICALLY (exception to this sheet's high-to-low convention)",
-        fmt6, pct_cols={"Pct_of_CCC_Universe", "Pct_of_Index"}, col_widths=widths6,
-    )
-    cat_idx = list(maturity_wall.columns).index("Maturity_Year")
-    ccc_idx = list(maturity_wall.columns).index("FaceValue_CCC")
-    idx_idx = list(maturity_wall.columns).index("FaceValue_Index")
-    add_dual_axis_bar_chart(
-        ws, f"{get_column_letter(chart_col)}{row}",
-        "Face Value Maturing, by Year — CCC-and-Below vs. Full Index ($mm)",
-        cat_idx, ccc_idx, idx_idx, info6["first_data_row"], info6["last_data_row"], left_col,
-        lhs_name="FaceValue CCC", rhs_name="FaceValue Index",
-        lhs_y_title="$mm (CCC-and-below)", rhs_y_title="$mm (Full index)",
-        height=11, width=22, rotate_labels=False,
-    )
-
-    # =========================================================================
-    # Index Snapshot sheet
-    # =========================================================================
-    summary = build_index_summary(args.index)
-    rating_buckets = build_rating_bucket_table(args.index)
-    sector_size = build_sector_size_table(args.index)
-    top_issuers = build_top_issuers_table(args.index, top_n=5)
-    subordination = build_subordination_table(args.index)
-
-    ws3 = wb.create_sheet("Index Snapshot")
-    ws3.sheet_view.showGridLines = False
-
-    ws3.merge_cells("A1:P1")
-    t3 = ws3.cell(row=1, column=1, value="ICE BofA H0A0 — Index Snapshot")
-    t3.font = TITLE_FONT
-    t3.fill = TITLE_FILL
-    t3.alignment = LEFT
-    ws3.merge_cells("A2:P2")
-    s3 = ws3.cell(row=2, column=1, value=f"Generated {datetime.today().strftime('%Y-%m-%d')}  |  Source: "
-                                          f"{args.index}  |  Snapshot of the current index, independent of any distress screen")
-    s3.font = Font(name=FONT_NAME, size=9, italic=True, color="1F4E78")
-    ws3.row_dimensions[1].height = 22
-
-    row3 = 4
-    summary_fmt = {
-        "Total Face Value ($mm)": "#,##0",
-        "Wtd Avg Price": "0.00",
-        "Wtd Avg OAS (bps)": "#,##0",
-        "Wtd Avg Yield to Worst": "0.0%",
-        "Wtd Avg Effective Duration (yrs)": "0.00",
+    ws_meth = wb.create_sheet("Methodologie")
+    region_oas = {
+        "US": (us_stats["fv_oas"], us_stats["mv_oas"]),
+        "EUR": (eur_stats["fv_oas"], eur_stats["mv_oas"]),
     }
-    sinfo = write_summary_block(ws3, summary, row3, left_col, "Index Summary", value_formats=summary_fmt)
-    row3 = sinfo["end_row"] + 3
-
-    # Rating bucket distribution + chart
-    fmt_rb = {"Total_FaceValue": "#,##0", "Pct_of_Index": "0.0%"}
-    widths_rb = {"Rating Bucket": 16, "N_Issuers": 11, "N_Bonds": 10, "Total_FaceValue": 15, "Pct_of_Index": 13}
-    info_rb = write_section(
-        ws3, rating_buckets, row3, left_col,
-        "Rating Bucket Distribution — Current Index",
-        "Source: Index.xlsx | Ratings rolled up to BB / B / CCC / CC / C / D | Ordered by seniority (not size)",
-        fmt_rb, pct_cols={"Pct_of_Index"}, col_widths=widths_rb,
-    )
-    cat_idx = list(rating_buckets.columns).index("Rating Bucket")
-    val_idx = list(rating_buckets.columns).index("Total_FaceValue")
-    add_bar_chart(
-        ws3, f"{get_column_letter(chart_col)}{row3}",
-        "Face Value by Rating Bucket ($mm)", "$mm",
-        cat_idx, val_idx, info_rb["first_data_row"], info_rb["last_data_row"], left_col,
-        height=10, width=16, num_fmt="#,##0", rotate_labels=False,
-    )
-    row3 = max(info_rb["end_row"], row3 + 22) + 3
-
-    # Sector exposure by size + chart
-    fmt_sec = {"Total_FaceValue": "#,##0", "Pct_of_Index": "0.0%", "Wavg_OAS": "#,##0"}
-    widths_sec = {"Sector": 24, "N_Issuers": 11, "N_Bonds": 10, "Total_FaceValue": 15, "Pct_of_Index": 13, "Wavg_OAS": 11}
-    info_sec = write_section(
-        ws3, sector_size, row3, left_col,
-        "Sector Exposure — Current Index (by Size)",
-        "Source: Index.xlsx | Grouped by Industry Lvl 3 | Sorted high-to-low by face value (composition view, not distress)",
-        fmt_sec, pct_cols={"Pct_of_Index"}, col_widths=widths_sec,
-    )
-    cat_idx = list(sector_size.columns).index("Sector")
-    val_idx = list(sector_size.columns).index("Total_FaceValue")
-    add_bar_chart(
-        ws3, f"{get_column_letter(chart_col)}{row3}",
-        "Sector Exposure — Face Value ($mm)", "$mm",
-        cat_idx, val_idx, info_sec["first_data_row"], info_sec["last_data_row"], left_col,
-        height=12, width=26, num_fmt="#,##0",
-    )
-    row3 = max(info_sec["end_row"], row3 + 26) + 3
-
-    # Top 5 issuers by face value
-    fmt_top = {"Total_FaceValue": "#,##0", "Pct_of_Index": "0.0%", "Wavg_OAS": "#,##0"}
-    widths_top = {"Ticker": 10, "Description": 42, "Sector": 16, "N_Bonds": 9, "Total_FaceValue": 15,
-                  "Pct_of_Index": 13, "Best_Rating": 12, "Wavg_OAS": 11}
-    info_top = write_section(
-        ws3, top_issuers, row3, left_col,
-        "Top 5 Issuers — Current Index (by Face Value)",
-        "Source: Index.xlsx | Grouped by Ticker | 'Best Rating' = highest-rated tranche the issuer has | Sorted high-to-low by face value (position size, not distress)",
-        fmt_top, pct_cols={"Pct_of_Index"}, col_widths=widths_top,
-    )
-    cat_idx = list(top_issuers.columns).index("Ticker")
-    val_idx = list(top_issuers.columns).index("Total_FaceValue")
-    add_bar_chart(
-        ws3, f"{get_column_letter(chart_col)}{row3}",
-        "Top 5 Issuers — Face Value ($mm)", "$mm",
-        cat_idx, val_idx, info_top["first_data_row"], info_top["last_data_row"], left_col,
-        height=9, width=14, num_fmt="#,##0", rotate_labels=False,
-    )
-    row3 = max(info_top["end_row"], row3 + 20) + 3
-
-    # Subordination type breakdown
-    fmt_sub = {"Total_FaceValue": "#,##0", "Pct_of_Index": "0.0%"}
-    widths_sub = {"Subordination Type": 22, "N_Bonds": 10, "Total_FaceValue": 15, "Pct_of_Index": 13}
-    write_section(
-        ws3, subordination, row3, left_col,
-        "Subordination Type Breakdown — Current Index",
-        "Source: Index.xlsx | Grouped by Subordination Type | Sorted high-to-low by face value",
-        fmt_sub, pct_cols={"Pct_of_Index"}, col_widths=widths_sub,
-    )
-
-    # --- Methodology sheet ---
-    _idx_all = _load_index(args.index)
-    fv_oas = _wavg(_idx_all, "OAS")
-    mv_oas = _wavg_mv(_idx_all, "OAS")
-
-    ws2 = wb.create_sheet("Methodology")
-    write_methodology_sheet(ws2, args.defaulted, args.index, args.months_back, fv_oas=fv_oas, mv_oas=mv_oas)
+    write_methodology_sheet(ws_meth, args.us_index, args.us_default, args.eur_index, args.eur_default,
+                             args.months_back, region_oas)
 
     wb.save(args.output)
     print(f"Saved: {args.output}")
